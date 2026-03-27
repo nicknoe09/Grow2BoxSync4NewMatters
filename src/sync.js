@@ -16,7 +16,23 @@ async function getClioDocuments(matter_id) {
     headers: { Authorization: `Bearer ${token}` },
     params: {
       matter_id,
-      fields: 'id,name,content_type,size,created_at',
+      fields: 'id,name,content_type,size,created_at,category',
+      limit: 200,
+    },
+  });
+
+  return resp.data?.data || [];
+}
+
+async function getClioNotes(matter_id) {
+  const token = process.env.CLIO_ACCESS_TOKEN;
+  if (!token) throw new Error('CLIO_ACCESS_TOKEN not set');
+
+  const resp = await axios.get('https://app.clio.com/api/v4/notes.json', {
+    headers: { Authorization: `Bearer ${token}` },
+    params: {
+      matter_id,
+      fields: 'id,subject,detail,date,created_at',
       limit: 200,
     },
   });
@@ -87,7 +103,7 @@ async function findBoxMatterFolder(matter_number, client_name) {
   return match || null;
 }
 
-async function findVitalDocumentsFolder(matter_folder_id) {
+async function listMatterSubfolders(matter_folder_id) {
   const token = await getBoxToken();
 
   const resp = await axios.get(
@@ -99,13 +115,41 @@ async function findVitalDocumentsFolder(matter_folder_id) {
   );
 
   const items = resp.data?.entries || [];
-  const vitalDocs = items.find(
-    (item) =>
-      item.type === 'folder' &&
-      item.name.toLowerCase().includes('vital')
-  );
+  return items.filter((item) => item.type === 'folder');
+}
 
-  return vitalDocs || null;
+// Keyword-based routing rules: [keywords, target subfolder name]
+const ROUTING_RULES = [
+  [['note', 'questionnaire', 'intake', 'consultation'], 'notes'],
+  [['will', 'trust', 'poa', 'power of attorney', 'hipaa', 'hippa', 'declaration', 'guardianship'], 'estate planning'],
+  [['death cert', 'birth cert', 'marriage', 'divorce', 'certificate'], 'vital records'],
+  [['deed', 'title', 'property'], 'real property'],
+  [['draft'], 'drafts'],
+  [['fee agreement', 'engagement'], 'fee agreement'],
+  [['pleading', 'motion', 'order', 'petition'], 'pleadings'],
+  [['correspondence', 'letter', 'email'], 'correspondence'],
+  [['tax', '1099', 'w-2', 'w2', 'return'], 'tax'],
+  [['expense', 'receipt', 'invoice'], 'expenses'],
+  [['creditor', 'claim', 'debt'], 'creditors'],
+  [['vehicle', 'car', 'auto'], 'vehicle'],
+];
+
+function categorizeDocument(filename, clioCategory) {
+  const lower = (clioCategory || '').toLowerCase() + ' ' + (filename || '').toLowerCase();
+
+  for (const [keywords, target] of ROUTING_RULES) {
+    if (keywords.some((kw) => lower.includes(kw))) {
+      return target;
+    }
+  }
+
+  return null; // no match — upload to root matter folder
+}
+
+function matchSubfolder(subfolders, targetName) {
+  if (!targetName) return null;
+  const target = targetName.toLowerCase();
+  return subfolders.find((f) => f.name.toLowerCase().includes(target)) || null;
 }
 
 async function uploadToBox(folder_id, filename, fileBuffer, contentType) {
@@ -142,20 +186,19 @@ async function sendSlackNotification({ matter_number, matter_name, client_name, 
 
   let text;
   if (files_uploaded.length > 0) {
-    const fileList = files_uploaded.map((f) => `• ${f}`).join('\n');
+    const fileList = files_uploaded.map((f) => `• ${f.name} → _${f.folder}_`).join('\n');
     text =
       `✅ *Clio → Box sync complete*\n` +
       `*Matter:* ${matter_number} — ${matter_name}\n` +
       `*Client:* ${client_name}\n` +
-      `*Files uploaded (${files_uploaded.length}):*\n${fileList}\n` +
-      (box_folder_url ? `*Box Folder:* <${box_folder_url}|Vital Documents>` : '');
+      `*Files routed (${files_uploaded.length}):*\n${fileList}\n` +
+      (box_folder_url ? `*Box Folder:* <${box_folder_url}|Open in Box>` : '');
   } else {
     text =
       `⚠️ *Clio → Box sync: no files found*\n` +
       `*Matter:* ${matter_number} — ${matter_name}\n` +
       `*Client:* ${client_name}\n` +
-      `No documents were attached to this matter in Clio yet. ` +
-      `If Lauren uploads files later, they won't be auto-synced.`;
+      `No documents or notes were found in Clio for this matter.`;
   }
 
   if (errors.length > 0) {
@@ -196,21 +239,23 @@ async function runFileSync({ matter_id, matter_number, matter_name, client_name 
       );
     }
     logger.info(`Found Box matter folder: ${matterFolder.name} (${matterFolder.id})`);
+    boxFolderUrl = `https://app.box.com/folder/${matterFolder.id}`;
 
-    // 2. Find Vital Documents subfolder
-    const vitalFolder = await findVitalDocumentsFolder(matterFolder.id);
-    if (!vitalFolder) {
-      throw new Error(`"Vital Documents" subfolder not found in Box folder ${matterFolder.name}`);
-    }
-    logger.info(`Found Vital Documents folder: ${vitalFolder.id}`);
-    boxFolderUrl = `https://app.box.com/folder/${vitalFolder.id}`;
+    // 2. List all subfolders in matter folder
+    const subfolders = await listMatterSubfolders(matterFolder.id);
+    logger.info(`Found ${subfolders.length} subfolder(s): ${subfolders.map((f) => f.name).join(', ')}`);
 
     // 3. Get Clio documents
     logger.info(`Fetching Clio documents for matter_id ${matter_id}`);
     const clioDocuments = await getClioDocuments(matter_id);
     logger.info(`Found ${clioDocuments.length} Clio document(s)`);
 
-    if (clioDocuments.length === 0) {
+    // 4. Get Clio notes
+    logger.info(`Fetching Clio notes for matter_id ${matter_id}`);
+    const clioNotes = await getClioNotes(matter_id);
+    logger.info(`Found ${clioNotes.length} Clio note(s)`);
+
+    if (clioDocuments.length === 0 && clioNotes.length === 0) {
       await sendSlackNotification({
         matter_number, matter_name, client_name,
         files_uploaded: [],
@@ -220,22 +265,49 @@ async function runFileSync({ matter_id, matter_number, matter_name, client_name 
       return;
     }
 
-    // 4. Download from Clio and upload to Box
+    // 5. Download documents from Clio and route to correct Box subfolder
     for (const doc of clioDocuments) {
       try {
-        logger.info(`Downloading: ${doc.name}`);
+        const category = categorizeDocument(doc.name, doc.category);
+        const targetFolder = matchSubfolder(subfolders, category);
+        const uploadFolderId = targetFolder ? targetFolder.id : matterFolder.id;
+        const folderLabel = targetFolder ? targetFolder.name : matterFolder.name;
+
+        logger.info(`Downloading: ${doc.name} → ${folderLabel}`);
         const fileBuffer = await downloadClioDocument(doc.id);
 
-        logger.info(`Uploading to Box: ${doc.name}`);
-        await uploadToBox(vitalFolder.id, doc.name, fileBuffer, doc.content_type);
-        filesUploaded.push(doc.name);
+        logger.info(`Uploading to Box: ${doc.name} → ${folderLabel}`);
+        await uploadToBox(uploadFolderId, doc.name, fileBuffer, doc.content_type);
+        filesUploaded.push({ name: doc.name, folder: folderLabel });
       } catch (err) {
         logger.error(`Failed to sync file ${doc.name}: ${err.message}`);
         errors.push(`${doc.name}: ${err.message}`);
       }
     }
 
-    // 5. Slack summary
+    // 6. Export notes as .txt files to Notes subfolder
+    const notesFolder = matchSubfolder(subfolders, 'notes');
+    const notesFolderId = notesFolder ? notesFolder.id : matterFolder.id;
+    const notesFolderLabel = notesFolder ? notesFolder.name : matterFolder.name;
+
+    for (const note of clioNotes) {
+      try {
+        const dateStr = note.date || note.created_at?.split('T')[0] || 'undated';
+        const subject = (note.subject || 'Note').replace(/[/\\:*?"<>|]/g, '-');
+        const filename = `${dateStr} - ${subject}.txt`;
+        const content = `${note.subject || 'Note'}\n${dateStr}\n\n${note.detail || '(empty)'}`;
+        const fileBuffer = Buffer.from(content, 'utf-8');
+
+        logger.info(`Uploading note: ${filename} → ${notesFolderLabel}`);
+        await uploadToBox(notesFolderId, filename, fileBuffer, 'text/plain');
+        filesUploaded.push({ name: filename, folder: notesFolderLabel });
+      } catch (err) {
+        logger.error(`Failed to sync note "${note.subject}": ${err.message}`);
+        errors.push(`Note "${note.subject}": ${err.message}`);
+      }
+    }
+
+    // 7. Slack summary
     await sendSlackNotification({
       matter_number, matter_name, client_name,
       files_uploaded: filesUploaded,

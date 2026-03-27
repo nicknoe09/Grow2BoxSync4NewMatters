@@ -65,6 +65,7 @@ router.post('/clio', async (req, res) => {
       matter_name: matter.description || matter.display_number,
       client_name: matter?.client?.name || 'Unknown Client',
       client_id: matter?.client?.id,
+      practice_area: matter?.practice_area?.name || null,
     };
 
     const delayMinutes = parseInt(process.env.DELAY_MINUTES || '60', 10);
