@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const { setupQueue } = require('./queue');
 const { webhookRouter } = require('./webhook');
+const { startWebhookRenewal } = require('./clio-webhook-renewal');
 const { logger } = require('./logger');
 
 const app = express();
@@ -23,6 +24,7 @@ async function start() {
   await setupQueue();
   app.listen(PORT, () => {
     logger.info(`Clio→Box sync service running on port ${PORT}`);
+    startWebhookRenewal();
   });
 }
 
